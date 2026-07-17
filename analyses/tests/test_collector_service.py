@@ -12,10 +12,12 @@ from analyses.services.tokopedia_collector import (
     chromium_launch_options,
     collect_review_sample,
     derive_store_slug,
+    extract_product_image_url,
     extract_official_store_status,
     extract_variations,
     navigate_with_retry,
     parse_compact_metric,
+    sanitize_product_image_url,
 )
 
 
@@ -34,6 +36,18 @@ class CollectorPureFunctionTest(SimpleTestCase):
         )
 
         self.assertEqual(slug, 'x-violet')
+
+    def test_product_image_url_only_accepts_tokopedia_https_hosts(self):
+        valid = sanitize_product_image_url(
+            'https://images.tokopedia.net/img/cache/product.jpg?width=700#preview'
+        )
+
+        self.assertEqual(
+            valid,
+            'https://images.tokopedia.net/img/cache/product.jpg?width=700',
+        )
+        self.assertIsNone(sanitize_product_image_url('http://images.tokopedia.net/a.jpg'))
+        self.assertIsNone(sanitize_product_image_url('https://tokopedia.net.evil.test/a.jpg'))
 
     def test_collector_config_rejects_unbounded_values(self):
         with self.assertRaises(ValueError):
@@ -190,6 +204,17 @@ class CollectorBrowserFixtureTest(SimpleTestCase):
 
         self.assertTrue(result['detected'])
         self.assertEqual(result['testId'], 'pdpShopBadgeOS')
+
+    def test_product_image_is_extracted_from_open_graph_metadata(self):
+        self.page.set_content(
+            '<meta property="og:image" '
+            'content="https://images.tokopedia.net/img/cache/product.jpg">'
+        )
+
+        self.assertEqual(
+            extract_product_image_url(self.page),
+            'https://images.tokopedia.net/img/cache/product.jpg',
+        )
 
     def test_structural_variation_controls_are_collected(self):
         self.page.set_content(

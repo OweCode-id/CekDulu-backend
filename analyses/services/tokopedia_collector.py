@@ -26,14 +26,25 @@ from analyses.validators import (
     normalize_tokopedia_product_url,
 )
 
-SCHEMA_VERSION = 'cekdulu-targeted-collector-0.4.1'
+SCHEMA_VERSION = 'cekdulu-targeted-collector-0.5.0'
 STORE_SLUG_PATTERN = re.compile(r'^[A-Za-z0-9._~-]{1,300}$')
+ALLOWED_PRODUCT_IMAGE_HOST_SUFFIXES = ('tokopedia.net', 'tokopedia.com')
 
 SELECTORS = {
     'product_name': [
         '[data-testid="lblPDPDetailProductName"]',
         '[data-testid="lblPDPProductNameJumper"]',
         'h1',
+    ],
+    'product_image_meta': [
+        'meta[property="og:image:secure_url"]',
+        'meta[property="og:image"]',
+        'meta[name="twitter:image"]',
+    ],
+    'product_image_element': [
+        '[data-testid="PDPMainImage"] img',
+        '[data-testid="PDPImageMain"] img',
+        'img[data-testid*="PDPMainImage"]',
     ],
     'price': [
         '[data-testid="lblPDPDetailProductPrice"]',
@@ -230,6 +241,27 @@ def first_attr(page: Page, selectors: list[str], attribute: str) -> str | None:
         except PlaywrightTimeoutError:
             continue
     return None
+
+
+def sanitize_product_image_url(value: str | None) -> str | None:
+    cleaned = clean_text(value, max_length=2_048)
+    if not cleaned:
+        return None
+    parsed = urlparse(cleaned)
+    host = (parsed.hostname or '').lower().rstrip('.')
+    allowed_host = any(
+        host == suffix or host.endswith(f'.{suffix}')
+        for suffix in ALLOWED_PRODUCT_IMAGE_HOST_SUFFIXES
+    )
+    if parsed.scheme != 'https' or not allowed_host or parsed.username or parsed.password:
+        return None
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', parsed.query, ''))
+
+
+def extract_product_image_url(page: Page) -> str | None:
+    meta_url = first_text(page, SELECTORS['product_image_meta'], max_length=2_048)
+    image_url = meta_url or first_attr(page, SELECTORS['product_image_element'], 'src')
+    return sanitize_product_image_url(image_url)
 
 
 def parse_idr(value: str | None) -> int | None:
@@ -898,6 +930,7 @@ def collect_product_page(
 
         product = {
             'name': first_text(page, SELECTORS['product_name'], max_length=500),
+            'imageUrl': extract_product_image_url(page),
             'price': parse_idr(price_raw),
             'priceRaw': price_raw,
             'originalPrice': parse_idr(original_price_raw),

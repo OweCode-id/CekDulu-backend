@@ -87,6 +87,11 @@ class AnalysisAPITest(APITestCase):
             verdict='low_risk',
             summary='Tidak ditemukan sinyal risiko utama.',
             result={'signals': [{'code': 'OFFICIAL_STORE', 'impact': -10}]},
+            evidence={
+                'product': {
+                    'imageUrl': 'https://images.tokopedia.net/img/cache/product.jpg'
+                }
+            },
         )
 
         response = self.client.get(reverse('analysis-detail', kwargs={'pk': analysis.pk}))
@@ -95,6 +100,10 @@ class AnalysisAPITest(APITestCase):
         self.assertEqual(response.data['riskScore'], 24)
         self.assertEqual(response.data['verdict'], 'low_risk')
         self.assertEqual(response.data['canonicalUrl'], analysis.canonical_url)
+        self.assertEqual(
+            response.data['productImageUrl'],
+            'https://images.tokopedia.net/img/cache/product.jpg',
+        )
         self.assertEqual(response.data['result'], analysis.result)
         self.assertIsNone(response.data['error'])
 
