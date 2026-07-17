@@ -48,6 +48,10 @@ class OpenRouterClientTest(SimpleTestCase):
         self.assertEqual(result['summary'], 'Waspada.')
         request = session.post.call_args
         self.assertEqual(request.kwargs['json']['model'], 'deepseek/deepseek-v4-flash')
+        self.assertEqual(
+            request.kwargs['json']['reasoning'],
+            {'effort': 'none', 'exclude': True},
+        )
         self.assertEqual(request.kwargs['timeout'], 10)
         self.assertEqual(request.kwargs['headers']['Authorization'], 'Bearer test-key')
 

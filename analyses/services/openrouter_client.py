@@ -101,13 +101,19 @@ class OpenRouterClient:
             'model': self.config.model,
             'temperature': 0.1,
             'max_tokens': 700,
+            'reasoning': {
+                'effort': 'none',
+                'exclude': True,
+            },
             'messages': [
                 {
                     'role': 'system',
                     'content': (
                         'Kamu menjelaskan hasil risk scoring CekDulu dalam Bahasa Indonesia. '
                         'Jangan mengubah skor, verdict, atau confidence. Jangan menganggap sampel '
-                        'review mewakili seluruh populasi. Jawab hanya JSON object dengan keys '
+                        'review mewakili seluruh populasi. Jangan pernah menyatakan produk pasti '
+                        'aman, terpercaya, scam, atau penipuan; gunakan bahasa indikasi berdasarkan '
+                        'evidence dan sebutkan keterbatasannya. Jawab hanya JSON object dengan keys '
                         'summary, reasons (array), dan followUpQuestions (array maksimal 3).'
                     ),
                 },
