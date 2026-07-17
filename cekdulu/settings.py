@@ -191,3 +191,24 @@ CELERY_TASK_TIME_LIMIT = int(os.getenv('CELERY_TASK_TIME_LIMIT', '210'))
 CELERY_TASK_ROUTES = {
     'analyses.tasks.collect_analysis_evidence': {'queue': 'collection'},
 }
+
+
+# Tokopedia browser collector
+TOKOPEDIA_BROWSER_CHANNEL = os.getenv('TOKOPEDIA_BROWSER_CHANNEL', 'chromium').strip()
+TOKOPEDIA_BROWSER_HEADED = os.getenv(
+    'TOKOPEDIA_BROWSER_HEADED',
+    'False',
+).strip().lower() == 'true'
+TOKOPEDIA_BLOCK_RESOURCES = os.getenv(
+    'TOKOPEDIA_BLOCK_RESOURCES',
+    'True',
+).strip().lower() == 'true'
+
+
+# OpenRouter
+OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '')
+OPENROUTER_MODEL = os.getenv('OPENROUTER_MODEL', 'deepseek/deepseek-v4-flash')
+OPENROUTER_BASE_URL = os.getenv('OPENROUTER_BASE_URL', 'https://openrouter.ai/api/v1')
+OPENROUTER_TIMEOUT_SECONDS = int(os.getenv('OPENROUTER_TIMEOUT_SECONDS', '30'))
+OPENROUTER_APP_NAME = os.getenv('OPENROUTER_APP_NAME', 'CekDulu')
+OPENROUTER_SITE_URL = os.getenv('OPENROUTER_SITE_URL', '')

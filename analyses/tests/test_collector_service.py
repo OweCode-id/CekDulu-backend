@@ -9,7 +9,9 @@ from analyses.services.tokopedia_collector import (
     CollectorError,
     PageStatus,
     build_output,
+    chromium_launch_options,
     collect_review_sample,
+    derive_store_slug,
     extract_official_store_status,
     extract_variations,
     navigate_with_retry,
@@ -26,6 +28,13 @@ class CollectorPureFunctionTest(SimpleTestCase):
         self.assertTrue(metric['approximate'])
         self.assertTrue(metric['lowerBound'])
 
+    def test_store_slug_is_derived_from_valid_product_url(self):
+        slug = derive_store_slug(
+            'https://www.tokopedia.com/x-violet/minyak-goreng-sunco-2-liter'
+        )
+
+        self.assertEqual(slug, 'x-violet')
+
     def test_collector_config_rejects_unbounded_values(self):
         with self.assertRaises(ValueError):
             CollectorConfig(max_product_reviews=41)
@@ -33,6 +42,22 @@ class CollectorPureFunctionTest(SimpleTestCase):
             CollectorConfig(navigation_attempts=4)
         with self.assertRaises(ValueError):
             CollectorConfig(retry_backoff_ms=())
+        with self.assertRaises(ValueError):
+            CollectorConfig(browser_channel='unsupported-browser')
+
+    def test_collector_uses_full_chromium_headless_mode(self):
+        options = chromium_launch_options(CollectorConfig())
+
+        self.assertTrue(options['headless'])
+        self.assertEqual(options['channel'], 'chromium')
+
+    def test_collector_can_use_visible_branded_chrome(self):
+        options = chromium_launch_options(
+            CollectorConfig(browser_channel='chrome', headed=True)
+        )
+
+        self.assertFalse(options['headless'])
+        self.assertEqual(options['channel'], 'chrome')
 
     def test_navigation_retries_transient_network_error(self):
         page = MagicMock()
@@ -49,6 +74,7 @@ class CollectorPureFunctionTest(SimpleTestCase):
         self.assertEqual(response_status, 200)
         self.assertEqual(attempts, 2)
         page.wait_for_timeout.assert_called_once_with(1)
+        self.assertEqual(page.goto.call_args.kwargs['wait_until'], 'commit')
 
     def test_navigation_does_not_retry_non_transient_error(self):
         page = MagicMock()
@@ -91,6 +117,49 @@ class CollectorPureFunctionTest(SimpleTestCase):
             result['quality']['analyzers']['productReviews']['representativeOfPopulation']
         )
         self.assertEqual(result['quality']['confidenceCap'], 'medium')
+
+    def test_store_slug_fallback_is_sufficient_without_false_name_mismatch(self):
+        status = PageStatus(
+            requestedUrl='https://www.tokopedia.com/x-violet/item',
+            finalUrl='https://www.tokopedia.com/x-violet/item',
+            responseStatus=200,
+            durationMs=100,
+            navigationAttempts=1,
+            blockSignals={},
+        )
+        product_data = {
+            'product': {
+                'name': 'Produk Demo',
+                'price': 100_000,
+                'variationCollection': {'collected': False},
+            },
+            'storeSummary': {
+                'name': 'x-violet',
+                'nameSource': 'url_slug',
+                'nameIsDisplayName': False,
+                'slug': 'x-violet',
+                'isOfficialStore': False,
+            },
+        }
+        store_data = {'store': {'name': 'X Violet Display Name'}}
+
+        result = build_output(
+            status.requestedUrl,
+            status,
+            product_data,
+            None,
+            store_data,
+        )
+
+        self.assertNotIn(
+            'storeSummary.name',
+            result['quality']['missingRequiredFields'],
+        )
+        self.assertTrue(result['quality']['sufficientForAnalysis'])
+        self.assertIn('STORE_NAME_FROM_URL_SLUG', result['quality']['warnings'])
+        self.assertEqual(result['quality']['confidenceCap'], 'medium')
+        self.assertNotIn('STORE_NAME_MISMATCH', result['quality']['warnings'])
+        self.assertIsNone(result['storeConsistency']['namesMatch'])
 
 
 class CollectorBrowserFixtureTest(SimpleTestCase):

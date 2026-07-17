@@ -5,10 +5,19 @@ from typing import Any
 
 from billiard.exceptions import SoftTimeLimitExceeded
 from celery import Task, shared_task
+from django.conf import settings
 from django.utils import timezone
 
 from analyses.models import AnalysisJob
-from analyses.services import TokopediaCollector
+from analyses.services import (
+    CollectorConfig,
+    OpenRouterClient,
+    OpenRouterError,
+    TokopediaCollector,
+    build_result,
+    fallback_explanation,
+    score_evidence,
+)
 from analyses.services.tokopedia_collector import CollectorError
 
 logger = logging.getLogger(__name__)
@@ -32,6 +41,7 @@ PUBLIC_ERROR_MESSAGES = {
     'INVALID_COLLECTOR_OUTPUT': 'Collector menghasilkan data yang tidak dapat diproses.',
     'NAVIGATION_ERROR': 'Halaman Tokopedia tidak dapat dibuka oleh collector.',
     'NETWORK_ERROR': 'Koneksi ke Tokopedia gagal setelah beberapa percobaan.',
+    'ANALYSIS_ERROR': 'Data berhasil dikumpulkan, tetapi analisis tidak dapat diselesaikan.',
 }
 
 
@@ -80,6 +90,24 @@ def _report_failure_code(report: dict[str, Any]) -> str:
     return product_page.get('errorCode') or 'COLLECTION_FAILED'
 
 
+def _report_failure_detail(report: dict[str, Any]) -> str:
+    product_page = report.get('collection', {}).get('productPage') or {}
+    return str(product_page.get('errorMessage') or '')
+
+
+def _compact_log_detail(detail: str | None) -> str:
+    return ' '.join(str(detail or 'detail unavailable').split())[:1_000]
+
+
+def _collector_config() -> CollectorConfig:
+    channel = str(settings.TOKOPEDIA_BROWSER_CHANNEL).strip() or None
+    return CollectorConfig(
+        browser_channel=channel,
+        headed=bool(settings.TOKOPEDIA_BROWSER_HEADED),
+        block_resources=bool(settings.TOKOPEDIA_BLOCK_RESOURCES),
+    )
+
+
 def _finish_failed(
     analysis_id: str,
     code: str,
@@ -108,7 +136,7 @@ def _finish_failed(
     return {'status': AnalysisJob.Status.FAILED, 'errorCode': code}
 
 
-def _finish_collected(analysis_id: str, report: dict[str, Any]) -> dict[str, str]:
+def _mark_analyzing(analysis_id: str, report: dict[str, Any]) -> None:
     now = timezone.now()
     AnalysisJob.objects.filter(
         pk=analysis_id,
@@ -120,7 +148,63 @@ def _finish_collected(analysis_id: str, report: dict[str, Any]) -> dict[str, str
         evidence=report,
         updated_at=now,
     )
-    return {'status': AnalysisJob.Status.ANALYZING}
+
+
+def _finish_analysis_failed(analysis_id: str) -> dict[str, str]:
+    now = timezone.now()
+    AnalysisJob.objects.filter(
+        pk=analysis_id,
+        status=AnalysisJob.Status.ANALYZING,
+    ).update(
+        status=AnalysisJob.Status.FAILED,
+        error_code='ANALYSIS_ERROR',
+        error_message=_public_error_message('ANALYSIS_ERROR'),
+        completed_at=now,
+        updated_at=now,
+    )
+    return {'status': AnalysisJob.Status.FAILED, 'errorCode': 'ANALYSIS_ERROR'}
+
+
+def _analyze_report(analysis_id: str, report: dict[str, Any]) -> dict[str, str]:
+    scoring = score_evidence(report)
+    explanation = fallback_explanation(scoring)
+    explanation_source = 'deterministic_fallback'
+    model = None
+
+    client = OpenRouterClient()
+    if client.enabled:
+        try:
+            explanation = client.explain(scoring, report)
+            explanation_source = 'openrouter'
+            model = client.config.model
+        except OpenRouterError:
+            logger.warning(
+                'OpenRouter explanation failed for analysis %s; using fallback.',
+                analysis_id,
+            )
+
+    result = build_result(
+        scoring,
+        explanation,
+        explanation_source=explanation_source,
+        model=model,
+    )
+    now = timezone.now()
+    AnalysisJob.objects.filter(
+        pk=analysis_id,
+        status=AnalysisJob.Status.ANALYZING,
+    ).update(
+        status=AnalysisJob.Status.COMPLETED,
+        result=result,
+        risk_score=scoring['riskScore'],
+        verdict=scoring['verdict'],
+        summary=explanation['summary'],
+        error_code='',
+        error_message='',
+        completed_at=now,
+        updated_at=now,
+    )
+    return {'status': AnalysisJob.Status.COMPLETED}
 
 
 def _retry_or_fail(
@@ -129,17 +213,26 @@ def _retry_or_fail(
     code: str,
     *,
     report: dict[str, Any] | None = None,
+    detail: str | None = None,
 ) -> dict[str, str]:
+    log_detail = _compact_log_detail(detail)
     if code in TRANSIENT_COLLECTION_ERRORS and task.request.retries < task.max_retries:
         logger.warning(
-            'Retrying collection for analysis %s after %s.',
+            'Retrying collection for analysis %s after %s: %s',
             analysis_id,
             code,
+            log_detail,
         )
         raise task.retry(
             exc=CollectionAttemptError(code),
             countdown=5,
         )
+    logger.warning(
+        'Collection failed for analysis %s after %s: %s',
+        analysis_id,
+        code,
+        log_detail,
+    )
     return _finish_failed(analysis_id, code, report=report)
 
 
@@ -162,9 +255,9 @@ def collect_analysis_evidence(task: Task, analysis_id: str) -> dict[str, str]:
     if source_url is None:
         return {'status': 'missing'}
     try:
-        report = TokopediaCollector().collect(source_url)
+        report = TokopediaCollector(config=_collector_config()).collect(source_url)
     except CollectorError as exc:
-        return _retry_or_fail(task, analysis_id, exc.code)
+        return _retry_or_fail(task, analysis_id, exc.code, detail=str(exc))
     except SoftTimeLimitExceeded:
         return _retry_or_fail(task, analysis_id, 'COLLECTION_TIMEOUT')
     except Exception:
@@ -180,7 +273,13 @@ def collect_analysis_evidence(task: Task, analysis_id: str) -> dict[str, str]:
 
     if report['status'] == 'failed':
         code = _report_failure_code(report)
-        return _retry_or_fail(task, analysis_id, code, report=report)
+        return _retry_or_fail(
+            task,
+            analysis_id,
+            code,
+            report=report,
+            detail=_report_failure_detail(report),
+        )
 
     if report.get('quality', {}).get('sufficientForAnalysis') is not True:
         return _finish_failed(
@@ -189,4 +288,9 @@ def collect_analysis_evidence(task: Task, analysis_id: str) -> dict[str, str]:
             report=report,
         )
 
-    return _finish_collected(analysis_id, report)
+    _mark_analyzing(analysis_id, report)
+    try:
+        return _analyze_report(analysis_id, report)
+    except Exception:
+        logger.exception('Unexpected risk analysis failure for analysis %s.', analysis_id)
+        return _finish_analysis_failed(analysis_id)
