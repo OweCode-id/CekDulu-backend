@@ -5,10 +5,12 @@ from typing import Any
 
 from billiard.exceptions import SoftTimeLimitExceeded
 from celery import Task, shared_task
+from django.conf import settings
 from django.utils import timezone
 
 from analyses.models import AnalysisJob
 from analyses.services import (
+    CollectorConfig,
     OpenRouterClient,
     OpenRouterError,
     TokopediaCollector,
@@ -86,6 +88,24 @@ def _canonical_url(report: dict[str, Any]) -> str:
 def _report_failure_code(report: dict[str, Any]) -> str:
     product_page = report.get('collection', {}).get('productPage') or {}
     return product_page.get('errorCode') or 'COLLECTION_FAILED'
+
+
+def _report_failure_detail(report: dict[str, Any]) -> str:
+    product_page = report.get('collection', {}).get('productPage') or {}
+    return str(product_page.get('errorMessage') or '')
+
+
+def _compact_log_detail(detail: str | None) -> str:
+    return ' '.join(str(detail or 'detail unavailable').split())[:1_000]
+
+
+def _collector_config() -> CollectorConfig:
+    channel = str(settings.TOKOPEDIA_BROWSER_CHANNEL).strip() or None
+    return CollectorConfig(
+        browser_channel=channel,
+        headed=bool(settings.TOKOPEDIA_BROWSER_HEADED),
+        block_resources=bool(settings.TOKOPEDIA_BLOCK_RESOURCES),
+    )
 
 
 def _finish_failed(
@@ -193,17 +213,26 @@ def _retry_or_fail(
     code: str,
     *,
     report: dict[str, Any] | None = None,
+    detail: str | None = None,
 ) -> dict[str, str]:
+    log_detail = _compact_log_detail(detail)
     if code in TRANSIENT_COLLECTION_ERRORS and task.request.retries < task.max_retries:
         logger.warning(
-            'Retrying collection for analysis %s after %s.',
+            'Retrying collection for analysis %s after %s: %s',
             analysis_id,
             code,
+            log_detail,
         )
         raise task.retry(
             exc=CollectionAttemptError(code),
             countdown=5,
         )
+    logger.warning(
+        'Collection failed for analysis %s after %s: %s',
+        analysis_id,
+        code,
+        log_detail,
+    )
     return _finish_failed(analysis_id, code, report=report)
 
 
@@ -226,9 +255,9 @@ def collect_analysis_evidence(task: Task, analysis_id: str) -> dict[str, str]:
     if source_url is None:
         return {'status': 'missing'}
     try:
-        report = TokopediaCollector().collect(source_url)
+        report = TokopediaCollector(config=_collector_config()).collect(source_url)
     except CollectorError as exc:
-        return _retry_or_fail(task, analysis_id, exc.code)
+        return _retry_or_fail(task, analysis_id, exc.code, detail=str(exc))
     except SoftTimeLimitExceeded:
         return _retry_or_fail(task, analysis_id, 'COLLECTION_TIMEOUT')
     except Exception:
@@ -244,7 +273,13 @@ def collect_analysis_evidence(task: Task, analysis_id: str) -> dict[str, str]:
 
     if report['status'] == 'failed':
         code = _report_failure_code(report)
-        return _retry_or_fail(task, analysis_id, code, report=report)
+        return _retry_or_fail(
+            task,
+            analysis_id,
+            code,
+            report=report,
+            detail=_report_failure_detail(report),
+        )
 
     if report.get('quality', {}).get('sufficientForAnalysis') is not True:
         return _finish_failed(

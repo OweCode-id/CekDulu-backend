@@ -13,6 +13,7 @@ def collection_report(
     status: str = 'completed',
     sufficient: bool = True,
     product_error: str | None = None,
+    product_error_message: str | None = None,
 ) -> dict:
     return {
         'schemaVersion': 'cekdulu-targeted-collector-test',
@@ -22,6 +23,7 @@ def collection_report(
             'productPage': {
                 'finalUrl': 'https://www.tokopedia.com/demo-shop/demo-product',
                 'errorCode': product_error,
+                'errorMessage': product_error_message,
             },
             'storeReviewPage': None,
         },
@@ -68,6 +70,23 @@ class CollectAnalysisEvidenceTaskTest(TestCase):
         self.assertEqual(analysis.result['trustScore'], 70)
         self.assertEqual(analysis.result['explanationSource'], 'deterministic_fallback')
         collector_class.return_value.collect.assert_called_once_with(analysis.source_url)
+
+    @override_settings(
+        TOKOPEDIA_BROWSER_CHANNEL='chrome',
+        TOKOPEDIA_BROWSER_HEADED=True,
+        TOKOPEDIA_BLOCK_RESOURCES=False,
+    )
+    @patch('analyses.tasks.TokopediaCollector')
+    def test_collection_uses_configured_browser(self, collector_class):
+        collector_class.return_value.collect.return_value = collection_report()
+        analysis = self.create_job()
+
+        collect_analysis_evidence.run(str(analysis.pk))
+
+        config = collector_class.call_args.kwargs['config']
+        self.assertEqual(config.browser_channel, 'chrome')
+        self.assertTrue(config.headed)
+        self.assertFalse(config.block_resources)
 
     @patch('analyses.tasks.TokopediaCollector')
     def test_partial_but_sufficient_collection_can_be_analyzed(self, collector_class):
@@ -178,6 +197,7 @@ class CollectAnalysisEvidenceTaskTest(TestCase):
             status='failed',
             sufficient=False,
             product_error='NETWORK_ERROR',
+            product_error_message='Page.goto: net::ERR_HTTP2_PROTOCOL_ERROR',
         )
         collector_class.return_value.collect.return_value = report
         analysis = self.create_job()
@@ -192,6 +212,7 @@ class CollectAnalysisEvidenceTaskTest(TestCase):
         self.assertEqual(analysis.status, AnalysisJob.Status.COLLECTING)
         self.assertEqual(retry.call_args.kwargs['countdown'], 5)
         log_warning.assert_called_once()
+        self.assertIn('ERR_HTTP2_PROTOCOL_ERROR', log_warning.call_args.args[-1])
 
     @patch('analyses.tasks.TokopediaCollector')
     def test_terminal_job_is_not_collected_again(self, collector_class):

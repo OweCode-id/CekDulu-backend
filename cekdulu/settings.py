@@ -193,6 +193,18 @@ CELERY_TASK_ROUTES = {
 }
 
 
+# Tokopedia browser collector
+TOKOPEDIA_BROWSER_CHANNEL = os.getenv('TOKOPEDIA_BROWSER_CHANNEL', 'chromium').strip()
+TOKOPEDIA_BROWSER_HEADED = os.getenv(
+    'TOKOPEDIA_BROWSER_HEADED',
+    'False',
+).strip().lower() == 'true'
+TOKOPEDIA_BLOCK_RESOURCES = os.getenv(
+    'TOKOPEDIA_BLOCK_RESOURCES',
+    'True',
+).strip().lower() == 'true'
+
+
 # OpenRouter
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '')
 OPENROUTER_MODEL = os.getenv('OPENROUTER_MODEL', 'deepseek/deepseek-v4-flash')

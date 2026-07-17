@@ -26,7 +26,8 @@ from analyses.validators import (
     normalize_tokopedia_product_url,
 )
 
-SCHEMA_VERSION = 'cekdulu-targeted-collector-0.4.0'
+SCHEMA_VERSION = 'cekdulu-targeted-collector-0.4.1'
+STORE_SLUG_PATTERN = re.compile(r'^[A-Za-z0-9._~-]{1,300}$')
 
 SELECTORS = {
     'product_name': [
@@ -73,6 +74,21 @@ TRANSIENT_NETWORK_MARKERS = (
     'ERR_NAME_NOT_RESOLVED',
 )
 
+NAVIGATION_WAIT_UNTIL = 'commit'
+SUPPORTED_BROWSER_CHANNELS = frozenset(
+    {
+        'chromium',
+        'chrome',
+        'chrome-beta',
+        'chrome-dev',
+        'chrome-canary',
+        'msedge',
+        'msedge-beta',
+        'msedge-dev',
+        'msedge-canary',
+    }
+)
+
 
 @dataclass(frozen=True)
 class CollectorConfig:
@@ -84,6 +100,8 @@ class CollectorConfig:
     headed: bool = False
     keep_images: bool = False
     collect_store_reviews: bool = True
+    browser_channel: str | None = 'chromium'
+    block_resources: bool = True
 
     def __post_init__(self) -> None:
         if self.timeout_ms < 1_000:
@@ -96,6 +114,21 @@ class CollectorConfig:
             raise ValueError('navigation_attempts harus berada pada rentang 1-3.')
         if not self.retry_backoff_ms or any(delay < 0 for delay in self.retry_backoff_ms):
             raise ValueError('retry_backoff_ms harus berisi jeda non-negatif.')
+        if (
+            self.browser_channel is not None
+            and self.browser_channel not in SUPPORTED_BROWSER_CHANNELS
+        ):
+            raise ValueError('browser_channel tidak didukung oleh Playwright.')
+
+
+def chromium_launch_options(config: CollectorConfig) -> dict[str, Any]:
+    """Build deterministic Chromium options for Tokopedia collection."""
+    options: dict[str, Any] = {
+        'headless': not config.headed,
+    }
+    if config.browser_channel:
+        options['channel'] = config.browser_channel
+    return options
 
 
 @dataclass
@@ -150,6 +183,20 @@ def derive_store_review_url(product_url: str) -> str:
     parsed = urlparse(normalized)
     path_parts = [part for part in parsed.path.split('/') if part]
     return f'https://www.tokopedia.com/{path_parts[0]}/review'
+
+
+def derive_store_slug(product_url: str) -> str | None:
+    """Return Tokopedia's URL store identifier without treating it as a display name."""
+    try:
+        normalized = normalize_tokopedia_product_url(product_url)
+    except TokopediaURLValidationError:
+        return None
+
+    path_parts = [part for part in urlparse(normalized).path.split('/') if part]
+    if not path_parts:
+        return None
+    slug = path_parts[0]
+    return slug if STORE_SLUG_PATTERN.fullmatch(slug) else None
 
 
 def first_text(page: Page, selectors: list[str], max_length: int | None = None) -> str | None:
@@ -346,7 +393,11 @@ def navigate_with_retry(
     last_error: Exception | None = None
     for attempt in range(1, config.navigation_attempts + 1):
         try:
-            response = page.goto(url, wait_until='domcontentloaded', timeout=config.timeout_ms)
+            response = page.goto(
+                url,
+                wait_until=NAVIGATION_WAIT_UNTIL,
+                timeout=config.timeout_ms,
+            )
             ensure_allowed_redirect(page.url)
             return (response.status if response else None), attempt
         except (PlaywrightError, PlaywrightTimeoutError) as exc:
@@ -827,9 +878,15 @@ def collect_product_page(
         info_raw = first_text(page, SELECTORS['product_info'], max_length=2_000)
         canonical = first_attr(page, ['link[rel="canonical"]'], 'href') or page.url
         ensure_allowed_redirect(canonical)
-        shop_name = first_text(page, SELECTORS['shop_name'], max_length=300)
-        shop_name = re.sub(r'\s*Follow\s*$', '', shop_name or '', flags=re.IGNORECASE).strip()
-        shop_name = shop_name or None
+        page_shop_name = first_text(page, SELECTORS['shop_name'], max_length=300)
+        page_shop_name = re.sub(
+            r'\s*Follow\s*$',
+            '',
+            page_shop_name or '',
+            flags=re.IGNORECASE,
+        ).strip()
+        page_shop_name = page_shop_name or None
+        store_slug = derive_store_slug(clean_url(canonical))
 
         price_raw = first_text(page, SELECTORS['price'])
         original_price_raw = first_text(page, SELECTORS['original_price'])
@@ -869,7 +926,16 @@ def collect_product_page(
         data = {
             'product': product,
             'storeSummary': {
-                'name': shop_name,
+                'name': page_shop_name or store_slug,
+                'nameSource': (
+                    'product_page'
+                    if page_shop_name
+                    else 'url_slug'
+                    if store_slug
+                    else None
+                ),
+                'nameIsDisplayName': page_shop_name is not None,
+                'slug': store_slug,
                 'isOfficialStore': official_store['detected'],
                 'officialStoreEvidence': official_store,
             },
@@ -1082,6 +1148,8 @@ def build_output(
     warnings: list[str] = []
     if not variation_collected:
         warnings.append('VARIATIONS_NOT_COLLECTED')
+    if store_summary.get('nameSource') == 'url_slug':
+        warnings.append('STORE_NAME_FROM_URL_SLUG')
     if product_review_size < 5:
         warnings.append('PRODUCT_REVIEW_SAMPLE_SMALL')
     elif product_rating_diversity < 2:
@@ -1113,7 +1181,8 @@ def build_output(
     summary_name = clean_text(store_summary.get('name'))
     store_name = clean_text(store.get('name'))
     names_match: bool | None = None
-    if summary_name and store_name:
+    summary_name_is_display_name = store_summary.get('nameIsDisplayName', True)
+    if summary_name and store_name and summary_name_is_display_name:
         normalized_summary = re.sub(r'[^a-z0-9]+', '', summary_name.casefold())
         normalized_store = re.sub(r'[^a-z0-9]+', '', store_name.casefold())
         names_match = normalized_summary == normalized_store
@@ -1121,6 +1190,8 @@ def build_output(
             warnings.append('STORE_NAME_MISMATCH')
     result['storeConsistency'] = {
         'productPageName': summary_name,
+        'productPageNameSource': store_summary.get('nameSource'),
+        'productPageNameIsDisplayName': summary_name_is_display_name,
         'storeReviewPageName': store_name,
         'namesMatch': names_match,
     }
@@ -1212,13 +1283,14 @@ class TokopediaCollector:
         playwright: Playwright,
         source_url: str,
     ) -> dict[str, Any]:
-        browser = playwright.chromium.launch(headless=not self.config.headed)
+        browser = playwright.chromium.launch(**chromium_launch_options(self.config))
         context = browser.new_context(
             locale='id-ID',
             timezone_id='Asia/Jakarta',
             viewport={'width': 1_440, 'height': 1_000},
         )
-        install_resource_filter(context, keep_images=self.config.keep_images)
+        if self.config.block_resources:
+            install_resource_filter(context, keep_images=self.config.keep_images)
         try:
             product_page = context.new_page()
             try:
