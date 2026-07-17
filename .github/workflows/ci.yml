@@ -58,6 +58,9 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements-dev.txt
 
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
+
       - name: Lint Python
         run: ruff check .
 
