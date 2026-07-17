@@ -6,3 +6,4 @@ psycopg2-binary==2.9.12
 requests==2.34.2
 urllib3==2.7.0
 python-dotenv==1.2.2
+playwright==1.61.0
