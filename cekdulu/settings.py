@@ -13,6 +13,7 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 import os
 from pathlib import Path
 
+from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -27,14 +28,21 @@ load_dotenv(BASE_DIR / '.env')
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-4*1(@$w!iv*6+r3sf*2j-1avko!l+hk)*%2c&r2-x^y0hrtz27'
-
 PRODUCTION = os.getenv('PRODUCTION', 'False').lower() == 'true'
 
-# SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEVELOPMENT_SECRET_KEY = 'django-insecure-development-only'
+SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', DEVELOPMENT_SECRET_KEY)
+if PRODUCTION and SECRET_KEY == DEVELOPMENT_SECRET_KEY:
+    raise ImproperlyConfigured('DJANGO_SECRET_KEY wajib diatur pada environment production.')
 
-ALLOWED_HOSTS = ["localhost", "127.0.0.1"]
+# SECURITY WARNING: don't run with debug turned on in production!
+DEBUG = not PRODUCTION and os.getenv('DEBUG', 'True').lower() == 'true'
+
+ALLOWED_HOSTS = [
+    host.strip()
+    for host in os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
+    if host.strip()
+]
 
 
 # Application definition
@@ -46,6 +54,8 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'rest_framework',
+    'analyses',
 ]
 
 MIDDLEWARE = [
@@ -81,24 +91,32 @@ WSGI_APPLICATION = 'cekdulu.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': os.getenv('PGDATABASE'),
-        'USER': os.getenv('PGUSER'),
-        'PASSWORD': os.getenv('PGPASSWORD'),
-        'HOST': os.getenv('PGHOST'),
-        'PORT': os.getenv('PGPORT', '5432'),
-        'OPTIONS': {
-            'sslmode': os.getenv('PGSSLMODE', 'require'),
-            'channel_binding': os.getenv('PGCHANNELBINDING', 'require'),
-        },
-        # Avoid reusing a connection after a Neon compute has scaled to zero.
-        'CONN_MAX_AGE': 0,
-        'CONN_HEALTH_CHECKS': True,
-        'DISABLE_SERVER_SIDE_CURSORS': True,
+if os.getenv('DATABASE_ENGINE', 'postgresql') == 'sqlite':
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
     }
-}
+else:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.postgresql',
+            'NAME': os.getenv('PGDATABASE'),
+            'USER': os.getenv('PGUSER'),
+            'PASSWORD': os.getenv('PGPASSWORD'),
+            'HOST': os.getenv('PGHOST'),
+            'PORT': os.getenv('PGPORT', '5432'),
+            'OPTIONS': {
+                'sslmode': os.getenv('PGSSLMODE', 'require'),
+                'channel_binding': os.getenv('PGCHANNELBINDING', 'require'),
+            },
+            # Avoid reusing a connection after a Neon compute has scaled to zero.
+            'CONN_MAX_AGE': 0,
+            'CONN_HEALTH_CHECKS': True,
+            'DISABLE_SERVER_SIDE_CURSORS': True,
+        }
+    }
 
 
 # Password validation
@@ -136,3 +154,17 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
 STATIC_URL = 'static/'
+
+
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': [],
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.AllowAny',
+    ],
+    'DEFAULT_RENDERER_CLASSES': [
+        'rest_framework.renderers.JSONRenderer',
+    ],
+    'DEFAULT_THROTTLE_RATES': {
+        'analysis_create': os.getenv('ANALYSIS_CREATE_RATE', '10/min'),
+    },
+}
