@@ -70,6 +70,70 @@ class RiskAnalyzerTest(SimpleTestCase):
         self.assertEqual(result['confidence']['level'], 'low')
         self.assertFalse(any(item['code'] == 'MISSING_REVIEWS' for item in result['signals']))
 
+    def test_incoherent_high_value_listing_produces_high_risk(self):
+        evidence = {
+            'product': {
+                'name': 'orang gila suka lepas kendaliiiiiiiiiii, merek toraja - kdkdkdkd',
+                'description': 'nsjskakdjskakdjdiejkwkrjrkwkejdjdkwwkwek',
+                'price': 200_000_000,
+                'rating': None,
+                'ratingCount': None,
+                'soldCountLowerBound': None,
+                'variationCollection': {
+                    'collected': True,
+                    'options': [
+                        {'label': 'kdkdkdkd'},
+                        {'label': 'kskdkdkd'},
+                        {'label': 'nsjdjd'},
+                        {'label': 'kwkdkdkdkdkdk'},
+                    ],
+                },
+            },
+            'storeSummary': {'isOfficialStore': False},
+            'store': {},
+            'storeConsistency': {'namesMatch': None},
+            'productReviews': {'sampleSize': 0, 'items': []},
+            'storeReviews': {'sampleSize': 0, 'items': []},
+            'quality': {
+                'confidenceCap': 'low',
+                'storeReviewPageCollected': True,
+            },
+        }
+
+        result = score_evidence(evidence)
+        signal_codes = {signal['code'] for signal in result['signals']}
+
+        self.assertEqual(result['riskScore'], 95)
+        self.assertEqual(result['verdict'], 'high_risk')
+        self.assertEqual(result['confidence']['level'], 'low')
+        self.assertIn('LISTING_TEXT_ANOMALY', signal_codes)
+        self.assertIn('VARIATION_TEXT_ANOMALY', signal_codes)
+        self.assertIn('HIGH_VALUE_PRICE_WITHOUT_REPUTATION', signal_codes)
+
+    def test_high_value_listing_with_strong_reputation_is_not_penalized(self):
+        evidence = evidence_fixture()
+        evidence['product'].update(
+            {
+                'name': 'Laptop workstation profesional 16 inci',
+                'description': 'Produk resmi dengan garansi dan spesifikasi lengkap.',
+                'price': 80_000_000,
+                'variations': [
+                    {'label': 'RAM 32 GB'},
+                    {'label': 'RAM 64 GB'},
+                ],
+            }
+        )
+
+        result = score_evidence(evidence)
+
+        self.assertEqual(result['riskScore'], 0)
+        self.assertFalse(
+            any(
+                signal['code'] == 'HIGH_VALUE_PRICE_WITHOUT_REPUTATION'
+                for signal in result['signals']
+            )
+        )
+
     def test_fallback_explanation_keeps_follow_up_questions(self):
         scoring = score_evidence(evidence_fixture())
 
