@@ -1,9 +1,10 @@
 from unittest.mock import patch
 
 from celery.exceptions import Retry
-from django.test import TestCase
+from django.test import TestCase, override_settings
 
 from analyses.models import AnalysisJob
+from analyses.services import OpenRouterError
 from analyses.tasks import collect_analysis_evidence
 
 
@@ -34,6 +35,7 @@ def collection_report(
     }
 
 
+@override_settings(OPENROUTER_API_KEY='')
 class CollectAnalysisEvidenceTaskTest(TestCase):
     def create_job(self, **overrides) -> AnalysisJob:
         values = {
@@ -43,7 +45,7 @@ class CollectAnalysisEvidenceTaskTest(TestCase):
         return AnalysisJob.objects.create(**values)
 
     @patch('analyses.tasks.TokopediaCollector')
-    def test_successful_collection_moves_job_to_analyzing(self, collector_class):
+    def test_successful_collection_completes_analysis(self, collector_class):
         report = collection_report()
         collector_class.return_value.collect.return_value = report
         analysis = self.create_job()
@@ -51,8 +53,8 @@ class CollectAnalysisEvidenceTaskTest(TestCase):
         result = collect_analysis_evidence.run(str(analysis.pk))
 
         analysis.refresh_from_db()
-        self.assertEqual(result, {'status': AnalysisJob.Status.ANALYZING})
-        self.assertEqual(analysis.status, AnalysisJob.Status.ANALYZING)
+        self.assertEqual(result, {'status': AnalysisJob.Status.COMPLETED})
+        self.assertEqual(analysis.status, AnalysisJob.Status.COMPLETED)
         self.assertEqual(analysis.evidence, report)
         self.assertEqual(
             analysis.collector_schema_version,
@@ -60,7 +62,11 @@ class CollectAnalysisEvidenceTaskTest(TestCase):
         )
         self.assertEqual(analysis.canonical_url, report['product']['canonicalUrl'])
         self.assertIsNotNone(analysis.started_at)
-        self.assertIsNone(analysis.completed_at)
+        self.assertIsNotNone(analysis.completed_at)
+        self.assertEqual(analysis.risk_score, 30)
+        self.assertEqual(analysis.verdict, 'caution')
+        self.assertEqual(analysis.result['trustScore'], 70)
+        self.assertEqual(analysis.result['explanationSource'], 'deterministic_fallback')
         collector_class.return_value.collect.assert_called_once_with(analysis.source_url)
 
     @patch('analyses.tasks.TokopediaCollector')
@@ -71,7 +77,56 @@ class CollectAnalysisEvidenceTaskTest(TestCase):
         collect_analysis_evidence.run(str(analysis.pk))
 
         analysis.refresh_from_db()
-        self.assertEqual(analysis.status, AnalysisJob.Status.ANALYZING)
+        self.assertEqual(analysis.status, AnalysisJob.Status.COMPLETED)
+
+    @patch('analyses.tasks.OpenRouterClient')
+    @patch('analyses.tasks.TokopediaCollector')
+    def test_openrouter_explanation_is_saved_without_changing_score(
+        self,
+        collector_class,
+        client_class,
+    ):
+        collector_class.return_value.collect.return_value = collection_report()
+        client = client_class.return_value
+        client.enabled = True
+        client.config.model = 'deepseek/deepseek-v4-flash'
+        client.explain.return_value = {
+            'summary': 'Penjelasan model.',
+            'reasons': ['Alasan model.'],
+            'followUpQuestions': ['Pertanyaan model?'],
+        }
+        analysis = self.create_job()
+
+        collect_analysis_evidence.run(str(analysis.pk))
+
+        analysis.refresh_from_db()
+        self.assertEqual(analysis.status, AnalysisJob.Status.COMPLETED)
+        self.assertEqual(analysis.risk_score, 30)
+        self.assertEqual(analysis.summary, 'Penjelasan model.')
+        self.assertEqual(analysis.result['explanationSource'], 'openrouter')
+        self.assertEqual(analysis.result['model'], 'deepseek/deepseek-v4-flash')
+
+    @patch('analyses.tasks.logger.warning')
+    @patch('analyses.tasks.OpenRouterClient')
+    @patch('analyses.tasks.TokopediaCollector')
+    def test_openrouter_failure_uses_deterministic_fallback(
+        self,
+        collector_class,
+        client_class,
+        log_warning,
+    ):
+        collector_class.return_value.collect.return_value = collection_report()
+        client = client_class.return_value
+        client.enabled = True
+        client.explain.side_effect = OpenRouterError('temporary failure')
+        analysis = self.create_job()
+
+        collect_analysis_evidence.run(str(analysis.pk))
+
+        analysis.refresh_from_db()
+        self.assertEqual(analysis.status, AnalysisJob.Status.COMPLETED)
+        self.assertEqual(analysis.result['explanationSource'], 'deterministic_fallback')
+        log_warning.assert_called_once()
 
     @patch('analyses.tasks.TokopediaCollector')
     def test_insufficient_collection_is_stored_and_failed(self, collector_class):

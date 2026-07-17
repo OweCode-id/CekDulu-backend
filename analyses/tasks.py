@@ -8,7 +8,14 @@ from celery import Task, shared_task
 from django.utils import timezone
 
 from analyses.models import AnalysisJob
-from analyses.services import TokopediaCollector
+from analyses.services import (
+    OpenRouterClient,
+    OpenRouterError,
+    TokopediaCollector,
+    build_result,
+    fallback_explanation,
+    score_evidence,
+)
 from analyses.services.tokopedia_collector import CollectorError
 
 logger = logging.getLogger(__name__)
@@ -32,6 +39,7 @@ PUBLIC_ERROR_MESSAGES = {
     'INVALID_COLLECTOR_OUTPUT': 'Collector menghasilkan data yang tidak dapat diproses.',
     'NAVIGATION_ERROR': 'Halaman Tokopedia tidak dapat dibuka oleh collector.',
     'NETWORK_ERROR': 'Koneksi ke Tokopedia gagal setelah beberapa percobaan.',
+    'ANALYSIS_ERROR': 'Data berhasil dikumpulkan, tetapi analisis tidak dapat diselesaikan.',
 }
 
 
@@ -108,7 +116,7 @@ def _finish_failed(
     return {'status': AnalysisJob.Status.FAILED, 'errorCode': code}
 
 
-def _finish_collected(analysis_id: str, report: dict[str, Any]) -> dict[str, str]:
+def _mark_analyzing(analysis_id: str, report: dict[str, Any]) -> None:
     now = timezone.now()
     AnalysisJob.objects.filter(
         pk=analysis_id,
@@ -120,7 +128,63 @@ def _finish_collected(analysis_id: str, report: dict[str, Any]) -> dict[str, str
         evidence=report,
         updated_at=now,
     )
-    return {'status': AnalysisJob.Status.ANALYZING}
+
+
+def _finish_analysis_failed(analysis_id: str) -> dict[str, str]:
+    now = timezone.now()
+    AnalysisJob.objects.filter(
+        pk=analysis_id,
+        status=AnalysisJob.Status.ANALYZING,
+    ).update(
+        status=AnalysisJob.Status.FAILED,
+        error_code='ANALYSIS_ERROR',
+        error_message=_public_error_message('ANALYSIS_ERROR'),
+        completed_at=now,
+        updated_at=now,
+    )
+    return {'status': AnalysisJob.Status.FAILED, 'errorCode': 'ANALYSIS_ERROR'}
+
+
+def _analyze_report(analysis_id: str, report: dict[str, Any]) -> dict[str, str]:
+    scoring = score_evidence(report)
+    explanation = fallback_explanation(scoring)
+    explanation_source = 'deterministic_fallback'
+    model = None
+
+    client = OpenRouterClient()
+    if client.enabled:
+        try:
+            explanation = client.explain(scoring, report)
+            explanation_source = 'openrouter'
+            model = client.config.model
+        except OpenRouterError:
+            logger.warning(
+                'OpenRouter explanation failed for analysis %s; using fallback.',
+                analysis_id,
+            )
+
+    result = build_result(
+        scoring,
+        explanation,
+        explanation_source=explanation_source,
+        model=model,
+    )
+    now = timezone.now()
+    AnalysisJob.objects.filter(
+        pk=analysis_id,
+        status=AnalysisJob.Status.ANALYZING,
+    ).update(
+        status=AnalysisJob.Status.COMPLETED,
+        result=result,
+        risk_score=scoring['riskScore'],
+        verdict=scoring['verdict'],
+        summary=explanation['summary'],
+        error_code='',
+        error_message='',
+        completed_at=now,
+        updated_at=now,
+    )
+    return {'status': AnalysisJob.Status.COMPLETED}
 
 
 def _retry_or_fail(
@@ -189,4 +253,9 @@ def collect_analysis_evidence(task: Task, analysis_id: str) -> dict[str, str]:
             report=report,
         )
 
-    return _finish_collected(analysis_id, report)
+    _mark_analyzing(analysis_id, report)
+    try:
+        return _analyze_report(analysis_id, report)
+    except Exception:
+        logger.exception('Unexpected risk analysis failure for analysis %s.', analysis_id)
+        return _finish_analysis_failed(analysis_id)
