@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 from django.core.cache import cache
 from django.urls import reverse
 from rest_framework import status
@@ -10,7 +12,8 @@ class AnalysisAPITest(APITestCase):
     def setUp(self):
         cache.clear()
 
-    def test_create_analysis_returns_accepted_job(self):
+    @patch('analyses.views.collect_analysis_evidence.delay')
+    def test_create_analysis_returns_accepted_job(self, enqueue):
         response = self.client.post(
             reverse('analysis-create'),
             {
@@ -37,6 +40,32 @@ class AnalysisAPITest(APITestCase):
         self.assertEqual(response.headers['Location'], detail_path)
         self.assertIsNone(response.data['result'])
         self.assertIsNone(response.data['error'])
+        enqueue.assert_called_once_with(str(analysis.pk))
+
+    @patch(
+        'analyses.views.collect_analysis_evidence.delay',
+        side_effect=RuntimeError('broker offline'),
+    )
+    @patch('analyses.views.logger.exception')
+    def test_create_analysis_returns_service_unavailable_when_enqueue_fails(
+        self,
+        log_exception,
+        enqueue,
+    ):
+        response = self.client.post(
+            reverse('analysis-create'),
+            {'url': 'https://www.tokopedia.com/demo-shop/demo-product'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        analysis = AnalysisJob.objects.get()
+        self.assertEqual(analysis.status, AnalysisJob.Status.FAILED)
+        self.assertEqual(analysis.error_code, 'QUEUE_UNAVAILABLE')
+        self.assertIsNotNone(analysis.completed_at)
+        self.assertEqual(response.data['error']['code'], 'QUEUE_UNAVAILABLE')
+        enqueue.assert_called_once_with(str(analysis.pk))
+        log_exception.assert_called_once()
 
     def test_create_analysis_rejects_unsupported_url(self):
         response = self.client.post(
@@ -95,7 +124,8 @@ class AnalysisAPITest(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
-    def test_create_analysis_is_rate_limited(self):
+    @patch('analyses.views.collect_analysis_evidence.delay')
+    def test_create_analysis_is_rate_limited(self, enqueue):
         url = reverse('analysis-create')
         payload = {'url': 'https://www.tokopedia.com/demo-shop/demo-product'}
 
@@ -106,3 +136,4 @@ class AnalysisAPITest(APITestCase):
         response = self.client.post(url, payload, format='json')
 
         self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+        self.assertEqual(enqueue.call_count, 10)
