@@ -20,6 +20,7 @@ class AnalysisCreateSerializer(serializers.Serializer):
 class AnalysisDetailSerializer(serializers.ModelSerializer):
     sourceUrl = serializers.URLField(source='source_url', read_only=True)
     canonicalUrl = serializers.SerializerMethodField()
+    productImageUrl = serializers.SerializerMethodField()
     riskScore = serializers.IntegerField(source='risk_score', read_only=True, allow_null=True)
     createdAt = serializers.DateTimeField(source='created_at', read_only=True)
     updatedAt = serializers.DateTimeField(source='updated_at', read_only=True)
@@ -34,6 +35,7 @@ class AnalysisDetailSerializer(serializers.ModelSerializer):
             'status',
             'sourceUrl',
             'canonicalUrl',
+            'productImageUrl',
             'riskScore',
             'verdict',
             'summary',
@@ -48,6 +50,12 @@ class AnalysisDetailSerializer(serializers.ModelSerializer):
 
     def get_canonicalUrl(self, instance: AnalysisJob) -> str | None:
         return instance.canonical_url or None
+
+    def get_productImageUrl(self, instance: AnalysisJob) -> str | None:
+        evidence = instance.evidence if isinstance(instance.evidence, dict) else {}
+        product = evidence.get('product', {})
+        image_url = product.get('imageUrl') if isinstance(product, dict) else None
+        return image_url if isinstance(image_url, str) and image_url else None
 
     def get_error(self, instance: AnalysisJob) -> dict[str, str] | None:
         if instance.status != AnalysisJob.Status.FAILED:
