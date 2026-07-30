@@ -3,7 +3,11 @@ from __future__ import annotations
 import re
 from typing import Any
 
-ANALYSIS_SCHEMA_VERSION = 'cekdulu-risk-analysis-0.1.0'
+ANALYSIS_SCHEMA_VERSION = 'cekdulu-risk-analysis-0.2.0'
+
+HIGH_VALUE_PRICE_IDR = 10_000_000
+VERY_HIGH_VALUE_PRICE_IDR = 50_000_000
+VOWELS = frozenset('aiueo')
 
 COMPLAINT_RULES = (
     (
@@ -63,6 +67,137 @@ def _review_items(evidence: dict[str, Any]) -> list[dict[str, Any]]:
             if isinstance(review, dict):
                 items.append(review)
     return items
+
+
+def _text_anomaly_markers(value: Any) -> set[str]:
+    text = re.sub(r'\s+', ' ', str(value or '')).strip().casefold()
+    if not text:
+        return set()
+
+    markers: set[str] = set()
+    tokens = re.findall(r'[a-z]+', text)
+    if re.search(r'([a-z])\1{5,}', text):
+        markers.add('repeated_characters')
+    if any(len(token) >= 24 for token in tokens):
+        markers.add('very_long_token')
+    if any(
+        len(token) >= 8 and not any(character in VOWELS for character in token)
+        for token in tokens
+    ):
+        markers.add('vowelless_token')
+    if any(re.search(r'([a-z]{2,3})\1{3,}', token) for token in tokens):
+        markers.add('repeated_fragment')
+    return markers
+
+
+def _variation_labels(product: dict[str, Any]) -> list[str]:
+    options = product.get('variationCollection', {}).get('options')
+    if not isinstance(options, list):
+        options = product.get('variations')
+    if not isinstance(options, list):
+        return []
+
+    labels: list[str] = []
+    for option in options:
+        value = option.get('label') if isinstance(option, dict) else option
+        label = re.sub(r'\s+', ' ', str(value or '')).strip()
+        if label:
+            labels.append(label)
+    return labels
+
+
+def _listing_text_signals(product: dict[str, Any]) -> list[dict[str, Any]]:
+    signals: list[dict[str, Any]] = []
+    anomalous_fields = [
+        (field, _text_anomaly_markers(product.get(field)))
+        for field in ('name', 'description')
+    ]
+    anomalous_fields = [(field, markers) for field, markers in anomalous_fields if markers]
+    if anomalous_fields:
+        field_labels = {'name': 'nama produk', 'description': 'deskripsi'}
+        labels = [field_labels[field] for field, _ in anomalous_fields]
+        impact = 25 if len(anomalous_fields) >= 2 else 15
+        signals.append(
+            _signal(
+                'LISTING_TEXT_ANOMALY',
+                'Teks listing tidak lazim',
+                impact,
+                'Pola karakter berulang atau token yang tidak lazim terdeteksi pada '
+                f"{' dan '.join(labels)}.",
+                [f'product.{field}' for field, _ in anomalous_fields],
+            )
+        )
+
+    variation_labels = _variation_labels(product)
+    anomalous_variations = [
+        label for label in variation_labels if _text_anomaly_markers(label)
+    ]
+    if len(anomalous_variations) >= 2:
+        impact = 20 if len(anomalous_variations) >= 3 else 15
+        signals.append(
+            _signal(
+                'VARIATION_TEXT_ANOMALY',
+                'Label variasi tidak lazim',
+                impact,
+                f'{len(anomalous_variations)} dari {len(variation_labels)} label variasi '
+                'memiliki pola teks yang tidak lazim.',
+                ['product.variationCollection.options'],
+            )
+        )
+    return signals
+
+
+def _metric_at_least(value: Any, minimum: int) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value >= minimum
+
+
+def _has_meaningful_reputation(evidence: dict[str, Any]) -> bool:
+    product = evidence.get('product', {})
+    store_summary = evidence.get('storeSummary', {})
+    store = evidence.get('store', {})
+    return any(
+        (
+            store_summary.get('isOfficialStore') is True,
+            _metric_at_least(product.get('ratingCount'), 3),
+            _metric_at_least(product.get('soldCountLowerBound'), 3),
+            _metric_at_least(evidence.get('productReviews', {}).get('sampleSize'), 3),
+            _metric_at_least(store.get('ratingCount'), 10),
+            _metric_at_least(store.get('soldCount'), 10),
+            _metric_at_least(evidence.get('storeReviews', {}).get('sampleSize'), 3),
+        )
+    )
+
+
+def _format_idr(value: int | float) -> str:
+    return f"Rp{value:,.0f}".replace(',', '.')
+
+
+def _high_value_price_signal(evidence: dict[str, Any]) -> dict[str, Any] | None:
+    price = evidence.get('product', {}).get('price')
+    if (
+        not isinstance(price, (int, float))
+        or isinstance(price, bool)
+        or price < HIGH_VALUE_PRICE_IDR
+        or _has_meaningful_reputation(evidence)
+    ):
+        return None
+
+    impact = 20 if price >= VERY_HIGH_VALUE_PRICE_IDR else 10
+    return _signal(
+        'HIGH_VALUE_PRICE_WITHOUT_REPUTATION',
+        'Transaksi bernilai tinggi tanpa dukungan reputasi',
+        impact,
+        f'Harga {_format_idr(price)} memiliki nilai transaksi tinggi, sementara evidence yang '
+        'terkumpul belum menunjukkan reputasi yang cukup dari badge official, rating, '
+        'penjualan, atau sampel review.',
+        [
+            'product.price',
+            'product.ratingCount',
+            'product.soldCountLowerBound',
+            'storeSummary.isOfficialStore',
+            'store.ratingCount',
+        ],
+    )
 
 
 def _complaint_signals(evidence: dict[str, Any]) -> list[dict[str, Any]]:
@@ -133,6 +268,11 @@ def score_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
     product = evidence.get('product', {})
     store_summary = evidence.get('storeSummary', {})
     store = evidence.get('store', {})
+
+    signals.extend(_listing_text_signals(product))
+    high_value_price_signal = _high_value_price_signal(evidence)
+    if high_value_price_signal:
+        signals.append(high_value_price_signal)
 
     if store_summary.get('isOfficialStore') is True:
         signals.append(
@@ -277,7 +417,7 @@ def build_result(
 ) -> dict[str, Any]:
     return {
         'schemaVersion': ANALYSIS_SCHEMA_VERSION,
-        'scoreMethod': 'deterministic_heuristic_v1',
+        'scoreMethod': 'deterministic_heuristic_v2',
         **scoring,
         'explanation': explanation,
         'explanationSource': explanation_source,
